@@ -4,6 +4,14 @@ set -e
 # Script for initializing repmgr in Kubernetes init containers
 # Used for registering master and replica nodes
 
+# Switch to postgres user for database operations
+if [ "$(id -u)" = "0" ]; then
+    echo "Running as root, switching to postgres user..."
+    exec gosu postgres "$0" "$@"
+else
+    echo "Already running as user: $(id -u)"
+fi
+
 # Environment variables (can be set via ConfigMap or environment)
 NODE_ID=${NODE_ID:-1}
 NODE_NAME=${NODE_NAME:-$(hostname)}
