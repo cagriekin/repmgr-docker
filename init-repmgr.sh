@@ -87,19 +87,14 @@ if [ "$NODE_TYPE" = "master" ]; then
     psql -h localhost -p 5432 -U "$ADMIN_USER" -d postgres -c "CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD}';" 2>/dev/null || true
     psql -h localhost -p 5432 -U "$ADMIN_USER" -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${REPMGR_DB} TO ${REPMGR_USER};" 2>/dev/null || true
 
-    # Check if repmgr extension is available, if not try to install it
-    if ! psql -h localhost -p 5432 -U postgres -d ${REPMGR_DB} -c "SELECT * FROM pg_available_extensions WHERE name = 'repmgr';" | grep -q repmgr; then
-        echo "Repmgr extension not available, attempting to install..."
-        # Try to install repmgr package if running as root
-        if [ "$(id -u)" = "0" ]; then
-            apt-get update && apt-get install -y postgresql-18-repmgr || echo "Failed to install repmgr package"
-        else
-            echo "Cannot install repmgr package - not running as root"
-        fi
+    # Note: repmgr extension should be created by PostgreSQL postStart hook
+    # Check if extension is available (should be installed by init container)
+    if ! psql -h localhost -p 5432 -U postgres -d ${REPMGR_DB} -c "SELECT * FROM pg_available_extensions WHERE name = 'repmgr';" 2>/dev/null | grep -q repmgr; then
+        echo "Warning: repmgr extension not found in pg_available_extensions"
+        echo "Extension files should have been copied by init-repmgr-extensions container"
+    else
+        echo "Repmgr extension is available"
     fi
-
-    # Create repmgr extension
-    psql -h localhost -p 5432 -U postgres -d ${REPMGR_DB} -c "CREATE EXTENSION IF NOT EXISTS repmgr;" 2>/dev/null || echo "Warning: Could not create repmgr extension"
 
     # Check if already registered
     if repmgr -f /etc/repmgr/repmgr.conf node status >/dev/null 2>&1; then
