@@ -6,7 +6,10 @@ set -e
 
 # Switch to postgres user for database operations
 if [ "$(id -u)" = "0" ]; then
+    echo "Running as root, switching to postgres user..."
     exec gosu postgres "$0" "$@"
+else
+    echo "Already running as user: $(id -u)"
 fi
 
 # Ensure repmgr configuration exists
