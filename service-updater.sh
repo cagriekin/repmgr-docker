@@ -19,25 +19,37 @@ echo "Monitoring Interval: ${MONITORING_INTERVAL}s"
 
 # Function to get current master from repmgr
 get_current_master() {
-    # Query repmgr to find the current primary
-    # This assumes we can connect to any node in the cluster
-    PRIMARY_NODE=$(PGPASSWORD=${REPMGR_PASSWORD} psql -h postgresql-master-0 -p 5432 -U ${REPMGR_USER} -d ${REPMGR_DB} -t -c "
-        SELECT node_name FROM repmgr.nodes WHERE type = 'primary' AND active = true LIMIT 1;
-    " 2>/dev/null | xargs)
+    local max_retries=3
+    local retry_count=0
 
-    if [ -z "$PRIMARY_NODE" ]; then
-        # Fallback: try other nodes
-        for node in postgresql-replica-0 postgresql-replica-1 postgresql-replica-2; do
-            PRIMARY_NODE=$(PGPASSWORD=${REPMGR_PASSWORD} psql -h ${node} -p 5432 -U ${REPMGR_USER} -d ${REPMGR_DB} -t -c "
-                SELECT node_name FROM repmgr.nodes WHERE type = 'primary' AND active = true LIMIT 1;
-            " 2>/dev/null | xargs)
-            if [ -n "$PRIMARY_NODE" ]; then
-                break
+    # List of nodes to try (master first, then replicas)
+    local nodes="postgresql-master-0 postgresql-replica-0 postgresql-replica-1 postgresql-replica-2"
+
+    while [ $retry_count -lt $max_retries ]; do
+        for node in $nodes; do
+            # Check if node is reachable first
+            if timeout 5 bash -c "echo > /dev/tcp/${node}/5432" 2>/dev/null; then
+                # Try to query repmgr database
+                PRIMARY_NODE=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h ${node} -p 5432 -U ${REPMGR_USER} -d ${REPMGR_DB} \
+                    -t -c "SELECT node_name FROM repmgr.nodes WHERE type = 'primary' AND active = true LIMIT 1;" 2>/dev/null | xargs)
+
+                # If we got a result, return it
+                if [ -n "$PRIMARY_NODE" ] && [ "$PRIMARY_NODE" != "ERROR:" ]; then
+                    echo "$PRIMARY_NODE"
+                    return 0
+                fi
             fi
         done
-    fi
 
-    echo "$PRIMARY_NODE"
+        retry_count=$((retry_count + 1))
+        if [ $retry_count -lt $max_retries ]; then
+            echo "Failed to determine master node (attempt $retry_count/$max_retries), retrying in 5 seconds..."
+            sleep 5
+        fi
+    done
+
+    # If we get here, we couldn't find the master
+    echo ""
 }
 
 # Function to update service selector
@@ -90,6 +102,9 @@ fi
 LAST_MASTER=""
 echo "Starting repmgr cluster monitoring..."
 
+CONSECUTIVE_FAILURES=0
+MAX_CONSECUTIVE_FAILURES=5
+
 while true; do
     CURRENT_MASTER=$(get_current_master)
 
@@ -97,9 +112,18 @@ while true; do
         echo "Master node change detected: ${LAST_MASTER} -> ${CURRENT_MASTER}"
         if update_service_selector "$CURRENT_MASTER"; then
             LAST_MASTER="$CURRENT_MASTER"
+            CONSECUTIVE_FAILURES=0
         fi
     elif [ -z "$CURRENT_MASTER" ]; then
-        echo "Warning: Could not determine current master node"
+        CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+        # Only log warning every 5 consecutive failures to reduce noise
+        if [ $CONSECUTIVE_FAILURES -ge $MAX_CONSECUTIVE_FAILURES ]; then
+            echo "Warning: Could not determine current master node (failed $CONSECUTIVE_FAILURES times)"
+            CONSECUTIVE_FAILURES=0  # Reset counter to avoid spamming logs
+        fi
+    else
+        # Success case - reset failure counter
+        CONSECUTIVE_FAILURES=0
     fi
 
     sleep ${MONITORING_INTERVAL}
