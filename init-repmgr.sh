@@ -14,6 +14,13 @@ REPMGR_DB=${REPMGR_DB:-repmgr}
 REPMGR_USER=${REPMGR_USER:-repmgr}
 REPMGR_PASSWORD=${REPMGR_PASSWORD:-repmgr}
 
+# Check if initialization is already complete
+MARKER_FILE="/tmp/repmgr-init-complete"
+if [ -f "$MARKER_FILE" ]; then
+    echo "Repmgr initialization already completed, skipping..."
+    exit 0
+fi
+
 # Generate repmgr configuration
 cat > /etc/repmgr/repmgr.conf << EOF
 node_id=${NODE_ID}
@@ -131,4 +138,6 @@ elif [ "$NODE_TYPE" = "witness" ]; then
     echo "Witness node registered successfully"
 fi
 
+# Mark initialization as complete
+touch "$MARKER_FILE"
 echo "Repmgr initialization completed"
