@@ -4,6 +4,11 @@ set -e
 # Entrypoint script for running repmgrd daemon as a sidecar container
 # This handles failover monitoring and promotion
 
+# Switch to postgres user for database operations
+if [ "$(id -u)" = "0" ]; then
+    exec gosu postgres "$0" "$@"
+fi
+
 # Ensure repmgr configuration exists
 if [ ! -f /etc/repmgr/repmgr.conf ]; then
     echo "Error: repmgr.conf not found at /etc/repmgr/repmgr.conf"
