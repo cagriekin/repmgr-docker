@@ -40,16 +40,45 @@ echo "Repmgr configuration generated for ${NODE_TYPE} node: ${NODE_NAME}"
 
 if [ "$NODE_TYPE" = "master" ]; then
     echo "Registering master node..."
+
     # Wait for PostgreSQL to be ready
-    until pg_isready -h localhost -p 5432 -U postgres; do
+    until pg_isready -h localhost -p 5432; do
         echo "Waiting for PostgreSQL..."
         sleep 2
     done
 
+    # Determine which user to use for initial connection
+    # Try connecting as postgres first, if that fails, we need to create the postgres user
+    if psql -h localhost -p 5432 -U postgres -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
+        ADMIN_USER="postgres"
+        echo "Connected as postgres user"
+    else
+        echo "postgres user not found, attempting to create it..."
+
+        # Try to connect as the configured postgres user from environment
+        if [ -n "$POSTGRES_USER" ] && [ -n "$POSTGRES_PASSWORD" ]; then
+            export PGPASSWORD="$POSTGRES_PASSWORD"
+            if psql -h localhost -p 5432 -U "$POSTGRES_USER" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
+                # Create postgres superuser if it doesn't exist
+                psql -h localhost -p 5432 -U "$POSTGRES_USER" -d postgres -c "CREATE USER postgres WITH SUPERUSER PASSWORD '$POSTGRES_PASSWORD';" 2>/dev/null || true
+                psql -h localhost -p 5432 -U "$POSTGRES_USER" -d postgres -c "ALTER USER postgres WITH PASSWORD '$POSTGRES_PASSWORD';" 2>/dev/null || true
+                ADMIN_USER="$POSTGRES_USER"
+                echo "Created postgres user and connected as $POSTGRES_USER"
+            else
+                echo "ERROR: Cannot connect as postgres or configured postgres user"
+                exit 1
+            fi
+        else
+            echo "ERROR: POSTGRES_USER and POSTGRES_PASSWORD not set, cannot initialize"
+            exit 1
+        fi
+    fi
+
     # Create repmgr database and user if they don't exist
-    psql -h localhost -p 5432 -U postgres -d postgres -c "CREATE DATABASE ${REPMGR_DB};" 2>/dev/null || true
-    psql -h localhost -p 5432 -U postgres -d postgres -c "CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD}';" 2>/dev/null || true
-    psql -h localhost -p 5432 -U postgres -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${REPMGR_DB} TO ${REPMGR_USER};" 2>/dev/null || true
+    export PGPASSWORD="$POSTGRES_PASSWORD"
+    psql -h localhost -p 5432 -U "$ADMIN_USER" -d postgres -c "CREATE DATABASE ${REPMGR_DB};" 2>/dev/null || true
+    psql -h localhost -p 5432 -U "$ADMIN_USER" -d postgres -c "CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD}';" 2>/dev/null || true
+    psql -h localhost -p 5432 -U "$ADMIN_USER" -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${REPMGR_DB} TO ${REPMGR_USER};" 2>/dev/null || true
 
     # Check if repmgr extension is available, if not try to install it
     if ! psql -h localhost -p 5432 -U postgres -d ${REPMGR_DB} -c "SELECT * FROM pg_available_extensions WHERE name = 'repmgr';" | grep -q repmgr; then
