@@ -54,9 +54,14 @@ if [ "$NODE_TYPE" = "master" ]; then
     # Create repmgr extension
     psql -h localhost -p 5432 -U postgres -d ${REPMGR_DB} -c "CREATE EXTENSION IF NOT EXISTS repmgr;" 2>/dev/null || true
 
-    # Register primary node
-    repmgr -f /etc/repmgr/repmgr.conf primary register --force || repmgr -f /etc/repmgr/repmgr.conf primary register
-    echo "Master node registered successfully"
+    # Check if already registered
+    if repmgr -f /etc/repmgr/repmgr.conf node status >/dev/null 2>&1; then
+        echo "Master node already registered, skipping registration"
+    else
+        # Register primary node
+        repmgr -f /etc/repmgr/repmgr.conf primary register --force || repmgr -f /etc/repmgr/repmgr.conf primary register
+        echo "Master node registered successfully"
+    fi
 
 elif [ "$NODE_TYPE" = "standby" ]; then
     echo "Registering standby node..."
@@ -67,12 +72,17 @@ elif [ "$NODE_TYPE" = "standby" ]; then
         sleep 2
     done
 
-    # Clone from upstream
-    repmgr -h ${UPSTREAM_HOST} -U ${REPMGR_USER} -d ${REPMGR_DB} -f /etc/repmgr/repmgr.conf standby clone --upstream-node-id=${UPSTREAM_NODE_ID}
+    # Check if already registered
+    if repmgr -f /etc/repmgr/repmgr.conf node status >/dev/null 2>&1; then
+        echo "Standby node already registered, skipping registration"
+    else
+        # Clone from upstream
+        repmgr -h ${UPSTREAM_HOST} -U ${REPMGR_USER} -d ${REPMGR_DB} -f /etc/repmgr/repmgr.conf standby clone --upstream-node-id=${UPSTREAM_NODE_ID}
 
-    # Register standby
-    repmgr -f /etc/repmgr/repmgr.conf standby register --upstream-node-id=${UPSTREAM_NODE_ID}
-    echo "Standby node registered successfully"
+        # Register standby
+        repmgr -f /etc/repmgr/repmgr.conf standby register --upstream-node-id=${UPSTREAM_NODE_ID}
+        echo "Standby node registered successfully"
+    fi
 
 elif [ "$NODE_TYPE" = "witness" ]; then
     echo "Registering witness node..."
