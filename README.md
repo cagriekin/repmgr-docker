@@ -1,205 +1,116 @@
 # PostgreSQL Repmgr Docker Image
 
-This Docker image provides PostgreSQL 18 with repmgr 5.4.0 for PostgreSQL replication management, built on Debian Trixie. It supports both standalone usage and Kubernetes integration for automatic failover.
-
-## Features
-
-- PostgreSQL 18 with repmgr 5.4.0 extension
-- Debian Trixie base image
-- Multiple execution modes for different use cases
-- Kubernetes-native sidecar support
-- Automatic PostgreSQL initialization
-- Repmgr configuration templating
-- Service updater for Kubernetes service selector management
+PostgreSQL 18 with repmgr 5.5.0 on Debian Trixie. Designed for Kubernetes StatefulSet deployments with automatic failover.
 
 ## Execution Modes
 
-The container supports different modes via command arguments:
+All modes are invoked via `/usr/local/bin/entrypoint.sh <mode>`:
 
-### Standalone Mode (Development/Testing)
-```bash
-docker run -d --name repmgr repmgr:debian-trixie standalone
-```
-
-### Kubernetes Integration Modes
-
-#### Init Container Mode
-Used for registering master/replica nodes during pod initialization:
-```bash
-# As init container command
-command: ["/usr/local/bin/entrypoint.sh", "init"]
-```
-
-#### Repmgrd Sidecar Mode
-Runs the repmgr daemon for monitoring and failover:
-```bash
-# As sidecar container command
-command: ["/usr/local/bin/entrypoint.sh", "repmgrd"]
-```
-
-#### Service Updater Sidecar Mode
-Updates Kubernetes service selectors during failover:
-```bash
-# As sidecar container command
-command: ["/usr/local/bin/entrypoint.sh", "service-updater"]
-```
-
-## Building the Image
-
-```bash
-# Build the Docker image
-docker build -t repmgr:debian-trixie .
-```
+| Mode | Purpose | Container Type |
+|------|---------|----------------|
+| `postgres` | Main PostgreSQL process with initdb and repmgr DB setup | Main container |
+| `init` | Generate repmgr.conf, clone standby data from primary | Init container |
+| `repmgrd` | Register node and run repmgr failover daemon | Sidecar |
+| `service-updater` | Patch Kubernetes Service selector on failover | Sidecar |
 
 ## Environment Variables
 
-### For Init Container Mode
-- `NODE_ID`: Unique node ID (required)
-- `NODE_NAME`: Node hostname (defaults to `$(hostname)`)
-- `NODE_TYPE`: `master`, `standby`, or `witness`
-- `UPSTREAM_NODE_ID`: Upstream node ID for standby registration
-- `REPMGR_DB`: Repmgr database name (default: `repmgr`)
-- `REPMGR_USER`: Repmgr user (default: `repmgr`)
-- `REPMGR_PASSWORD`: Repmgr password (default: `repmgr`)
+### postgres mode
 
-### For Service Updater Mode
-- `NAMESPACE`: Kubernetes namespace (default: `default`)
-- `MASTER_SERVICE`: Name of master service to update (default: `postgresql-master`)
-- `MONITORING_INTERVAL`: Check interval in seconds (default: `30`)
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PGDATA` | No | Data directory (default: `/var/lib/postgresql/data/pgdata`) |
+| `POSTGRES_USER` | Yes | Application database user |
+| `POSTGRES_PASSWORD` | Yes | Application database password |
+| `POSTGRES_DB` | Yes | Application database name |
+| `REPMGR_USER` | No | Repmgr user (default: `repmgr`) |
+| `REPMGR_PASSWORD` | Yes | Repmgr password |
+| `REPMGR_DB` | No | Repmgr database (default: `repmgr`) |
 
+### init mode
 
-### Master StatefulSet
-```yaml
-# In postgresql-master-statefulset.yaml
-spec:
-  template:
-    spec:
-      initContainers:
-      - name: repmgr-init
-        image: repmgr:debian-trixie
-        command: ["/usr/local/bin/entrypoint.sh", "init"]
-        env:
-        - name: NODE_TYPE
-          value: "master"
-        - name: NODE_ID
-          value: "1"
-      containers:
-      - name: postgresql
-        # ... postgresql container config
-      - name: repmgrd
-        image: repmgr:debian-trixie
-        command: ["/usr/local/bin/entrypoint.sh", "repmgrd"]
-      - name: service-updater
-        image: repmgr:debian-trixie
-        command: ["/usr/local/bin/entrypoint.sh", "service-updater"]
-        env:
-        - name: NAMESPACE
-          valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
-```
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `HEADLESS_SERVICE` | Yes | Headless service FQDN for node discovery |
+| `REPMGR_PASSWORD` | Yes | Repmgr password |
+| `REPMGR_USER` | No | Repmgr user (default: `repmgr`) |
+| `REPMGR_DB` | No | Repmgr database (default: `repmgr`) |
+| `PGDATA` | No | Data directory (default: `/var/lib/postgresql/data/pgdata`) |
 
-### Replica StatefulSet
-```yaml
-# In postgresql-replica-statefulset.yaml
-spec:
-  template:
-    spec:
-      initContainers:
-      - name: repmgr-init
-        image: repmgr:debian-trixie
-        command: ["/usr/local/bin/entrypoint.sh", "init"]
-        env:
-        - name: NODE_TYPE
-          value: "standby"
-        - name: UPSTREAM_NODE_ID
-          value: "1"
-      containers:
-      - name: postgresql
-        # ... postgresql container config
-      - name: repmgrd
-        image: repmgr:debian-trixie
-        command: ["/usr/local/bin/entrypoint.sh", "repmgrd"]
-      - name: service-updater
-        image: repmgr:debian-trixie
-        command: ["/usr/local/bin/entrypoint.sh", "service-updater"]
-```
+### repmgrd mode
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PGDATA` | No | Data directory (default: `/var/lib/postgresql/data/pgdata`) |
+
+Reads `/etc/repmgr/repmgr.conf` generated by the init container.
+
+### service-updater mode
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `NAMESPACE` | Yes | Kubernetes namespace |
+| `MASTER_SERVICE` | Yes | Service name to patch on failover |
+| `HEADLESS_SERVICE` | Yes | Headless service FQDN for node discovery |
+| `REPMGR_PASSWORD` | Yes | Repmgr password |
+| `REPMGR_USER` | No | Repmgr user (default: `repmgr`) |
+| `REPMGR_DB` | No | Repmgr database (default: `repmgr`) |
+| `MONITORING_INTERVAL` | No | Check interval in seconds (default: `30`) |
+
+## How It Works
+
+### Initial Deployment
+
+1. **Init container** (`init` mode) runs first on each pod:
+   - Ordinal 0: generates `repmgr.conf`, exits (first boot with empty data)
+   - Ordinal N: generates `repmgr.conf`, waits for primary, runs `repmgr standby clone` via `pg_basebackup`
+
+2. **Main container** (`postgres` mode):
+   - First boot (ordinal 0): runs `initdb`, configures WAL replication settings, creates app DB/user and repmgr DB/user/extension, starts postgres
+   - Subsequent boots or standbys: starts postgres with existing data
+
+3. **repmgrd sidecar**: waits for local postgres, checks `pg_is_in_recovery()` to determine role, registers as primary or standby, starts repmgrd daemon
+
+4. **service-updater sidecar**: polls repmgr cluster state, patches the Kubernetes Service `statefulset.kubernetes.io/pod-name` selector when the primary changes
+
+### Failover
+
+When the primary pod goes down:
+1. repmgrd on standbys detects primary failure after monitoring threshold
+2. One standby is promoted to primary via `repmgr standby promote`
+3. Other standbys follow the new primary via `repmgr standby follow`
+4. service-updater detects the change and patches the Service selector
+
+### Failed Primary Rejoin
+
+When the old primary pod restarts:
+1. Init container detects existing data directory
+2. Probes partner nodes (ordinals 0-9) to find the current primary
+3. If another primary exists, wipes data and re-clones as standby
+4. repmgrd registers as standby (detected via `pg_is_in_recovery()`)
+
+### Scale Up/Down
+
+- **Scale up**: new pod's init container clones from current primary
+- **Scale down**: removed pods leave stale entries in `repmgr.nodes` (harmless)
+- **Scale back up with stale PVC**: init container compares local timeline with primary's timeline, re-clones on mismatch
 
 ## Volumes
 
-- `/var/lib/postgresql/data`: PostgreSQL data directory
-- `/var/log/repmgr`: Repmgr log files
-- `/etc/repmgr`: Repmgr configuration directory
+| Path | Purpose |
+|------|---------|
+| `/var/lib/postgresql/data` | PostgreSQL data directory (PVC) |
+| `/etc/repmgr` | repmgr.conf generated by init container (emptyDir, shared) |
 
-## Ports
+## Building
 
-- `5432`: PostgreSQL port
-
-## Managing Replication
-
-### Check cluster status
 ```bash
-repmgr cluster show
-```
-
-### Check node status
-```bash
-repmgr node status
-```
-
-### Manual failover
-```bash
-repmgr standby promote --node-id=<node-id>
-```
-
-### Rejoin failed master
-```bash
-repmgr node rejoin --node-id=<node-id>
-```
-
-## Security Considerations
-
-- Change default passwords in production
-- Use Kubernetes secrets for sensitive environment variables
-- Configure proper RBAC for service updater sidecar
-- Restrict network policies for inter-pod communication
-- Use TLS for PostgreSQL connections in production
-
-## Troubleshooting
-
-### Check container logs
-```bash
-docker logs <container-name>
-```
-
-### Check repmgr logs
-```bash
-docker exec <container-name> tail -f /var/log/repmgr/repmgr.log
-```
-
-### Connect to PostgreSQL
-```bash
-docker exec -it <container-name> psql -U postgres -d postgres
-```
-
-### Check repmgr status
-```bash
-docker exec <container-name> repmgr cluster show
-```
-
-### Kubernetes troubleshooting
-```bash
-# Check pod status
-kubectl get pods
-
-# Check service selector
-kubectl get service <service-name> -o yaml
-
-# Check repmgr configuration
-kubectl exec <pod-name> -- cat /etc/repmgr/repmgr.conf
+docker build -t cagriekin/repmgr:trixie-5.5.0 .
 ```
 
 ## Compatibility
 
 - PostgreSQL 18
-- repmgr 5.4.0
+- repmgr 5.5.0
 - Debian Trixie
 - Kubernetes 1.19+
