@@ -1,40 +1,33 @@
 #!/bin/bash
 set -e
 
-# Script for initializing repmgr in Kubernetes init containers
-# Used for registering master and replica nodes
-
-# Switch to postgres user for database operations
 if [ "$(id -u)" = "0" ]; then
-    echo "Running as root, switching to postgres user..."
     exec gosu postgres "$0" "$@"
+fi
+
+ORDINAL=${HOSTNAME##*-}
+NODE_ID=$((ORDINAL + 1000))
+
+if [ "$ORDINAL" = "0" ]; then
+    NODE_TYPE="master"
 else
-    echo "Already running as user: $(id -u)"
+    NODE_TYPE="standby"
 fi
 
-# Environment variables (can be set via ConfigMap or environment)
-NODE_ID=${NODE_ID:-1}
-NODE_NAME=${NODE_NAME:-$(hostname)}
-CLUSTER_NAME=${CLUSTER_NAME:-pgvector-cluster}
-NODE_TYPE=${NODE_TYPE:-master}
-UPSTREAM_NODE_ID=${UPSTREAM_NODE_ID:-1}
-REPMGR_DB=${REPMGR_DB:-repmgr}
+HEADLESS_SERVICE=${HEADLESS_SERVICE:?HEADLESS_SERVICE is required}
 REPMGR_USER=${REPMGR_USER:-repmgr}
-REPMGR_PASSWORD=${REPMGR_PASSWORD:-repmgr}
+REPMGR_PASSWORD=${REPMGR_PASSWORD:?REPMGR_PASSWORD is required}
+REPMGR_DB=${REPMGR_DB:-repmgr}
+PGDATA=${PGDATA:-/var/lib/postgresql/data/pgdata}
+NODE_FQDN="${HOSTNAME}.${HEADLESS_SERVICE}"
 
-# Check if initialization is already complete
-MARKER_FILE="/tmp/repmgr-init-complete"
-if [ -f "$MARKER_FILE" ]; then
-    echo "Repmgr initialization already completed, skipping..."
-    exit 0
-fi
+echo "Node: ${HOSTNAME}, Ordinal: ${ORDINAL}, Type: ${NODE_TYPE}, ID: ${NODE_ID}"
 
-# Generate repmgr configuration
 cat > /etc/repmgr/repmgr.conf << EOF
 node_id=${NODE_ID}
-node_name=${NODE_NAME}
-conninfo='host=${NODE_NAME} port=5432 user=${REPMGR_USER} password=${REPMGR_PASSWORD} dbname=${REPMGR_DB} connect_timeout=10'
-data_directory='/var/lib/postgresql/data'
+node_name=${HOSTNAME}
+conninfo='host=${NODE_FQDN} port=5432 user=${REPMGR_USER} password=${REPMGR_PASSWORD} dbname=${REPMGR_DB} connect_timeout=10'
+data_directory='${PGDATA}'
 pg_bindir='/usr/lib/postgresql/18/bin'
 replication_user='${REPMGR_USER}'
 replication_type='physical'
@@ -42,105 +35,126 @@ failover='automatic'
 promote_command='repmgr standby promote -f /etc/repmgr/repmgr.conf'
 follow_command='repmgr standby follow -f /etc/repmgr/repmgr.conf --upstream-node-id=%n'
 monitoring_history=true
-log_file='/var/log/repmgr/repmgr.log'
 log_level=INFO
 log_status_interval=10
-service_start_command='pg_ctl -D /var/lib/postgresql/data start'
-service_stop_command='pg_ctl -D /var/lib/postgresql/data stop'
-service_restart_command='pg_ctl -D /var/lib/postgresql/data restart'
-service_reload_command='pg_ctl -D /var/lib/postgresql/data reload'
+service_start_command='/usr/lib/postgresql/18/bin/pg_ctl -D ${PGDATA} start'
+service_stop_command='/usr/lib/postgresql/18/bin/pg_ctl -D ${PGDATA} stop'
+service_restart_command='/usr/lib/postgresql/18/bin/pg_ctl -D ${PGDATA} restart'
+service_reload_command='/usr/lib/postgresql/18/bin/pg_ctl -D ${PGDATA} reload'
 EOF
 
-echo "Repmgr configuration generated for ${NODE_TYPE} node: ${NODE_NAME}"
+echo "Generated repmgr.conf for ${NODE_TYPE} node"
+
+find_current_primary() {
+    BASE_NAME="${HOSTNAME%-*}"
+    for i in $(seq 0 9); do
+        [ "$i" = "$ORDINAL" ] && continue
+        PARTNER="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
+        if PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "${PARTNER}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1; then
+            IN_RECOVERY=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h "${PARTNER}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs)
+            if [ "$IN_RECOVERY" = "f" ]; then
+                echo "$PARTNER"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
 
 if [ "$NODE_TYPE" = "master" ]; then
-    echo "Registering master node..."
+    if [ ! -s "${PGDATA}/PG_VERSION" ]; then
+        echo "First boot, postgres mode will initialize the database"
+        exit 0
+    fi
 
-    # Wait for PostgreSQL to be ready
-    until pg_isready -h localhost -p 5432; do
-        echo "Waiting for PostgreSQL..."
-        sleep 2
-    done
-
-    # Determine which user to use for initial connection
-    # Try connecting as postgres first, if that fails, we need to create the postgres user
-    if psql -h localhost -p 5432 -U postgres -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
-        ADMIN_USER="postgres"
-        echo "Connected as postgres user"
-    else
-        echo "postgres user not found, attempting to create it..."
-
-        # Try to connect as the configured postgres user from environment
-        if [ -n "$POSTGRES_USER" ] && [ -n "$POSTGRES_PASSWORD" ]; then
-            export PGPASSWORD="$POSTGRES_PASSWORD"
-            if psql -h localhost -p 5432 -U "$POSTGRES_USER" -d postgres -c "SELECT 1;" >/dev/null 2>&1; then
-                # Create postgres superuser if it doesn't exist
-                psql -h localhost -p 5432 -U "$POSTGRES_USER" -d postgres -c "CREATE USER postgres WITH SUPERUSER PASSWORD '$POSTGRES_PASSWORD';" 2>/dev/null || true
-                psql -h localhost -p 5432 -U "$POSTGRES_USER" -d postgres -c "ALTER USER postgres WITH PASSWORD '$POSTGRES_PASSWORD';" 2>/dev/null || true
-                ADMIN_USER="$POSTGRES_USER"
-                echo "Created postgres user and connected as $POSTGRES_USER"
-            else
-                echo "ERROR: Cannot connect as postgres or configured postgres user"
-                exit 1
+    # Data exists. Check if another node was promoted while this one was down.
+    echo "Data directory exists, checking for post-failover scenario..."
+    CURRENT_PRIMARY=$(find_current_primary) || true
+    if [ -n "$CURRENT_PRIMARY" ]; then
+        echo "Another primary found at ${CURRENT_PRIMARY}, re-cloning as standby..."
+        rm -rf "${PGDATA:?}"/*
+        for attempt in $(seq 1 5); do
+            if PGPASSWORD="${REPMGR_PASSWORD}" repmgr -h "${CURRENT_PRIMARY}" -U "${REPMGR_USER}" -d "${REPMGR_DB}" -f /etc/repmgr/repmgr.conf standby clone --force; then
+                echo "Re-cloned as standby from ${CURRENT_PRIMARY}"
+                exit 0
             fi
-        else
-            echo "ERROR: POSTGRES_USER and POSTGRES_PASSWORD not set, cannot initialize"
-            exit 1
-        fi
+            echo "Clone attempt ${attempt} failed, retrying in 5s..."
+            sleep 5
+        done
+        echo "ERROR: All clone attempts failed"
+        exit 1
     fi
 
-    # Create repmgr database and user if they don't exist
-    export PGPASSWORD="$POSTGRES_PASSWORD"
-    psql -h localhost -p 5432 -U "$ADMIN_USER" -d postgres -c "CREATE DATABASE ${REPMGR_DB};" 2>/dev/null || true
-    psql -h localhost -p 5432 -U "$ADMIN_USER" -d postgres -c "CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD}';" 2>/dev/null || true
-    psql -h localhost -p 5432 -U "$ADMIN_USER" -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${REPMGR_DB} TO ${REPMGR_USER};" 2>/dev/null || true
-
-    # Note: repmgr extension should be created by PostgreSQL postStart hook
-    # Check if extension is available (should be installed by init container)
-    if ! psql -h localhost -p 5432 -U postgres -d ${REPMGR_DB} -c "SELECT * FROM pg_available_extensions WHERE name = 'repmgr';" 2>/dev/null | grep -q repmgr; then
-        echo "Warning: repmgr extension not found in pg_available_extensions"
-        echo "Extension files should have been copied by init-repmgr-extensions container"
-    else
-        echo "Repmgr extension is available"
-    fi
-
-    # Check if already registered
-    if repmgr -f /etc/repmgr/repmgr.conf node status >/dev/null 2>&1; then
-        echo "Master node already registered, skipping registration"
-    else
-        # Register primary node
-        repmgr -f /etc/repmgr/repmgr.conf primary register --force || repmgr -f /etc/repmgr/repmgr.conf primary register
-        echo "Master node registered successfully"
-    fi
-
-elif [ "$NODE_TYPE" = "standby" ]; then
-    echo "Registering standby node..."
-    # Wait for upstream to be ready
-    UPSTREAM_HOST=${UPSTREAM_HOST:-postgresql-master-0}
-    until pg_isready -h ${UPSTREAM_HOST} -p 5432 -U ${REPMGR_USER}; do
-        echo "Waiting for upstream node ${UPSTREAM_HOST}..."
-        sleep 2
-    done
-
-    # Check if already registered
-    if repmgr -f /etc/repmgr/repmgr.conf node status >/dev/null 2>&1; then
-        echo "Standby node already registered, skipping registration"
-    else
-        # Clone from upstream
-        repmgr -h ${UPSTREAM_HOST} -U ${REPMGR_USER} -d ${REPMGR_DB} -f /etc/repmgr/repmgr.conf standby clone --upstream-node-id=${UPSTREAM_NODE_ID}
-
-        # Register standby
-        repmgr -f /etc/repmgr/repmgr.conf standby register --upstream-node-id=${UPSTREAM_NODE_ID}
-        echo "Standby node registered successfully"
-    fi
-
-elif [ "$NODE_TYPE" = "witness" ]; then
-    echo "Registering witness node..."
-    # Witness registration logic
-    repmgr -f /etc/repmgr/repmgr.conf witness register --upstream-node-id=${UPSTREAM_NODE_ID}
-    echo "Witness node registered successfully"
+    echo "No other primary found, continuing as primary"
+    exit 0
 fi
 
-# Mark initialization as complete
-touch "$MARKER_FILE"
-echo "Repmgr initialization completed"
+# Standby path: wait for primary, then clone if needed
+wait_for_primary() {
+    BASE_NAME="${HOSTNAME%-*}"
+    echo "Searching for primary node..."
+    for i in $(seq 1 120); do
+        PRIMARY_FQDN=$(find_current_primary) || true
+        if [ -n "$PRIMARY_FQDN" ]; then
+            echo "Primary found at ${PRIMARY_FQDN}"
+            return 0
+        fi
+        # Fall back to ordinal 0 on first boot
+        FQDN_0="${BASE_NAME}-0.${HEADLESS_SERVICE}"
+        if PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "${FQDN_0}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1; then
+            if PGPASSWORD="${REPMGR_PASSWORD}" psql -h "${FQDN_0}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -c "SELECT 1;" > /dev/null 2>&1; then
+                PRIMARY_FQDN="$FQDN_0"
+                echo "Primary found at ${PRIMARY_FQDN}"
+                return 0
+            fi
+        fi
+        if [ "$i" = "120" ]; then
+            echo "ERROR: Timed out waiting for primary"
+            return 1
+        fi
+        sleep 2
+    done
+}
+
+wait_for_primary
+PRIMARY_FQDN=${PRIMARY_FQDN:?PRIMARY_FQDN must be set by wait_for_primary}
+
+echo "Waiting for primary to be registered in repmgr..."
+for i in $(seq 1 120); do
+    REGISTERED=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h "${PRIMARY_FQDN}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -t -c "SELECT count(*) FROM repmgr.nodes WHERE type = 'primary' AND active = true;" 2>/dev/null | xargs)
+    if [ "$REGISTERED" = "1" ]; then
+        echo "Primary is registered"
+        break
+    fi
+    if [ "$i" = "120" ]; then
+        echo "ERROR: Timed out waiting for primary registration"
+        exit 1
+    fi
+    sleep 2
+done
+
+if [ -s "${PGDATA}/PG_VERSION" ]; then
+    LOCAL_TIMELINE=$(pg_controldata -D "${PGDATA}" 2>/dev/null | grep "Latest checkpoint's TimeLineID" | awk '{print $NF}')
+    PRIMARY_TIMELINE=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h "${PRIMARY_FQDN}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -t -c "SELECT timeline_id FROM pg_control_checkpoint();" 2>/dev/null | xargs)
+
+    if [ "$LOCAL_TIMELINE" = "$PRIMARY_TIMELINE" ]; then
+        echo "Data directory exists and timeline matches ($LOCAL_TIMELINE), skipping clone"
+        exit 0
+    fi
+
+    echo "Timeline mismatch (local: ${LOCAL_TIMELINE}, primary: ${PRIMARY_TIMELINE}), re-cloning..."
+    rm -rf "${PGDATA:?}"/*
+fi
+
+echo "Cloning from primary at ${PRIMARY_FQDN}..."
+for attempt in $(seq 1 5); do
+    if PGPASSWORD="${REPMGR_PASSWORD}" repmgr -h "${PRIMARY_FQDN}" -U "${REPMGR_USER}" -d "${REPMGR_DB}" -f /etc/repmgr/repmgr.conf standby clone --force; then
+        echo "Clone successful"
+        exit 0
+    fi
+    echo "Clone attempt ${attempt} failed, retrying in 5s..."
+    sleep 5
+done
+
+echo "ERROR: All clone attempts failed"
+exit 1

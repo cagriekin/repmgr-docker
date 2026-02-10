@@ -1,42 +1,64 @@
 #!/bin/bash
 set -e
 
-# Entrypoint script for running repmgrd daemon as a sidecar container
-# This handles failover monitoring and promotion
-
-# Switch to postgres user for database operations
 if [ "$(id -u)" = "0" ]; then
-    echo "Running as root, switching to postgres user..."
     exec gosu postgres "$0" "$@"
-else
-    echo "Already running as user: $(id -u)"
 fi
 
-# Ensure repmgr configuration exists
 if [ ! -f /etc/repmgr/repmgr.conf ]; then
-    echo "Error: repmgr.conf not found at /etc/repmgr/repmgr.conf"
-    echo "This script should be run after init-repmgr.sh has generated the configuration"
+    echo "ERROR: repmgr.conf not found at /etc/repmgr/repmgr.conf"
     exit 1
+fi
+
+PGDATA=${PGDATA:-/var/lib/postgresql/data/pgdata}
+
+echo "Waiting for local PostgreSQL..."
+for i in $(seq 1 120); do
+    if pg_isready -h 127.0.0.1 -p 5432 > /dev/null 2>&1; then
+        echo "PostgreSQL is ready"
+        break
+    fi
+    if [ "$i" = "120" ]; then
+        echo "ERROR: Timed out waiting for local PostgreSQL"
+        exit 1
+    fi
+    sleep 2
+done
+
+IN_RECOVERY=$(psql -h 127.0.0.1 -U postgres -d postgres -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs)
+
+if [ "$IN_RECOVERY" = "f" ]; then
+    echo "Registering primary node..."
+    repmgr -f /etc/repmgr/repmgr.conf primary register --force
+    echo "Primary registered"
+else
+    echo "Registering standby node..."
+    for attempt in $(seq 1 30); do
+        if repmgr -f /etc/repmgr/repmgr.conf standby register --force 2>/dev/null; then
+            echo "Standby registered"
+            break
+        fi
+        if [ "$attempt" = "30" ]; then
+            echo "ERROR: Failed to register standby after 30 attempts"
+            exit 1
+        fi
+        sleep 5
+    done
 fi
 
 echo "Starting repmgrd daemon..."
 
-# Set up signal handling for graceful shutdown
 cleanup() {
-    echo "Stopping repmgrd daemon..."
     kill -TERM $REPMGRD_PID 2>/dev/null || true
     wait $REPMGRD_PID 2>/dev/null || true
-    echo "Repmgrd daemon stopped"
     exit 0
 }
 
 trap cleanup SIGTERM SIGINT
 
-# Start repmgrd daemon in background
 repmgrd -f /etc/repmgr/repmgr.conf --daemonize=no &
 REPMGRD_PID=$!
 
-echo "Repmgrd daemon started with PID: $REPMGRD_PID"
+echo "repmgrd started with PID: $REPMGRD_PID"
 
-# Wait for repmgrd to exit
 wait $REPMGRD_PID
