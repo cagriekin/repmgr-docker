@@ -44,6 +44,21 @@ else
         fi
         sleep 5
     done
+
+    NODE_ID=$(grep 'node_id' /etc/repmgr/repmgr.conf | head -1 | sed 's/[^0-9]//g')
+    echo "Waiting for standby registration to replicate locally (node_id=${NODE_ID})..."
+    for i in $(seq 1 60); do
+        LOCAL_TYPE=$(psql -h 127.0.0.1 -U repmgr -d repmgr -t -c "SELECT type FROM repmgr.nodes WHERE node_id = ${NODE_ID};" 2>/dev/null | xargs)
+        if [ "$LOCAL_TYPE" = "standby" ]; then
+            echo "Local repmgr metadata confirmed: type=standby"
+            break
+        fi
+        if [ "$i" = "60" ]; then
+            echo "ERROR: Timed out waiting for standby registration to replicate locally (current type: ${LOCAL_TYPE})"
+            exit 1
+        fi
+        sleep 1
+    done
 fi
 
 echo "Starting repmgrd daemon..."
