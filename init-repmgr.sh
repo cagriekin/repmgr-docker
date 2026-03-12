@@ -34,6 +34,8 @@ replication_type='physical'
 failover='automatic'
 promote_command='repmgr standby promote -f /etc/repmgr/repmgr.conf'
 follow_command='repmgr standby follow -f /etc/repmgr/repmgr.conf --upstream-node-id=%n'
+reconnect_attempts=3
+reconnect_interval=10
 monitoring_history=true
 log_level=INFO
 log_status_interval=10
