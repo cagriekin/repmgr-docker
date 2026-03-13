@@ -46,19 +46,26 @@ else
     done
 
     NODE_ID=$(grep 'node_id' /etc/repmgr/repmgr.conf | head -1 | sed 's/[^0-9]//g')
-    echo "Waiting for standby registration to replicate locally (node_id=${NODE_ID})..."
-    for i in $(seq 1 60); do
-        LOCAL_TYPE=$(psql -h 127.0.0.1 -U repmgr -d repmgr -t -c "SELECT type FROM repmgr.nodes WHERE node_id = ${NODE_ID};" 2>/dev/null | xargs)
-        if [ "$LOCAL_TYPE" = "standby" ]; then
-            echo "Local repmgr metadata confirmed: type=standby"
-            break
-        fi
-        if [ "$i" = "60" ]; then
-            echo "ERROR: Timed out waiting for standby registration to replicate locally (current type: ${LOCAL_TYPE})"
-            exit 1
-        fi
-        sleep 1
-    done
+    PRIMARY_CONNINFO=$(grep 'conninfo' /etc/repmgr/repmgr.conf | head -1 | sed "s/.*'\\(.*\\)'.*/\\1/")
+    PRIMARY_HOST=$(psql "${PRIMARY_CONNINFO}" -t -c "SELECT conninfo FROM repmgr.nodes WHERE type = 'primary' AND active = true LIMIT 1;" 2>/dev/null | grep -oP "host=\K[^ ']+") || true
+
+    if [ -n "$PRIMARY_HOST" ]; then
+        echo "Verifying standby registration on primary (node_id=${NODE_ID})..."
+        for i in $(seq 1 30); do
+            REG_TYPE=$(psql -h "$PRIMARY_HOST" -U repmgr -d repmgr -t -c "SELECT type FROM repmgr.nodes WHERE node_id = ${NODE_ID};" 2>/dev/null | xargs)
+            if [ "$REG_TYPE" = "standby" ]; then
+                echo "Primary confirms registration: type=standby"
+                break
+            fi
+            if [ "$i" = "30" ]; then
+                echo "ERROR: Primary does not show node ${NODE_ID} as standby (current type: ${REG_TYPE})"
+                exit 1
+            fi
+            sleep 1
+        done
+    else
+        echo "WARNING: Could not determine primary host, skipping registration check"
+    fi
 fi
 
 echo "Starting repmgrd daemon..."
