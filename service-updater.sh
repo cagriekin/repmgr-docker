@@ -68,9 +68,38 @@ update_service_selector() {
     }"
 }
 
+check_pgpool_health() {
+    if [ -z "$PGPOOL_SERVICE" ]; then
+        return
+    fi
+
+    if [ "$CURRENT_MASTER" != "$HOSTNAME" ]; then
+        return
+    fi
+
+    PGPASSWORD=${POSTGRES_PASSWORD} timeout 5 psql \
+        -h "${PGPOOL_SERVICE}" -p "${PGPOOL_PORT}" \
+        -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+        -t -c "SELECT 1;" > /dev/null 2>&1
+
+    if [ $? -ne 0 ]; then
+        PGPOOL_FAILURES=$((PGPOOL_FAILURES + 1))
+        echo "WARNING: pgpool health check failed ($PGPOOL_FAILURES/${MAX_PGPOOL_FAILURES})"
+        if [ $PGPOOL_FAILURES -ge $MAX_PGPOOL_FAILURES ]; then
+            echo "pgpool unresponsive after $PGPOOL_FAILURES consecutive failures, restarting"
+            kubectl rollout restart deployment "${PGPOOL_DEPLOYMENT}" -n "${NAMESPACE}"
+            PGPOOL_FAILURES=0
+        fi
+    else
+        PGPOOL_FAILURES=0
+    fi
+}
+
 LAST_MASTER=""
 CONSECUTIVE_FAILURES=0
 MAX_CONSECUTIVE_FAILURES=5
+PGPOOL_FAILURES=0
+MAX_PGPOOL_FAILURES=3
 
 while true; do
     CURRENT_MASTER=$(get_current_master)
@@ -80,6 +109,7 @@ while true; do
         if update_service_selector "$CURRENT_MASTER"; then
             LAST_MASTER="$CURRENT_MASTER"
             CONSECUTIVE_FAILURES=0
+            PGPOOL_FAILURES=0
         fi
     elif [ -z "$CURRENT_MASTER" ]; then
         CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
@@ -89,6 +119,7 @@ while true; do
         fi
     else
         CONSECUTIVE_FAILURES=0
+        check_pgpool_health
     fi
 
     sleep ${MONITORING_INTERVAL}
