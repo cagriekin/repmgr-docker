@@ -27,6 +27,13 @@ listen_addresses = '*'
 shared_preload_libraries = 'repmgr'
 EOF
 
+            if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
+                cat >> "$PGDATA/postgresql.conf" << PGBR
+archive_mode = on
+archive_command = 'pgbackrest --stanza=${PGBACKREST_STANZA:-db} archive-push %p'
+PGBR
+            fi
+
             cat > "$PGDATA/pg_hba.conf" << EOF
 local   all             all                                     trust
 local   replication     all                                     trust

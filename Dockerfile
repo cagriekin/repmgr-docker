@@ -19,6 +19,8 @@ RUN echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.
 RUN apt-get update && apt-get install -y \
     postgresql-18 \
     postgresql-18-repmgr \
+    pgbackrest \
+    cron \
     && rm -rf /var/lib/apt/lists/*
 
 # Install kubectl for service updater sidecar
