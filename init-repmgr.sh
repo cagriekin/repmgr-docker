@@ -37,6 +37,7 @@ follow_command='repmgr standby follow -f /etc/repmgr/repmgr.conf --upstream-node
 reconnect_attempts=3
 reconnect_interval=10
 monitoring_history=true
+monitoring_history_keep=7
 log_level=INFO
 log_status_interval=10
 service_start_command='/usr/lib/postgresql/18/bin/pg_ctl -D ${PGDATA} start'
