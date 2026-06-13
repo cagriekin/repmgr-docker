@@ -4,9 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag (e.g., 18-5.5.0)'
+        description: 'Image tag (e.g., trixie-5.5.0-8)'
         required: true
         type: string
+  push:
+    tags:
+      - 'trixie-*'
 
 permissions:
   contents: read
@@ -17,6 +20,21 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "$tag" ]; then
+            echo "Could not resolve an image tag" >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -43,6 +61,6 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: cagriekin/repmgr:${{ inputs.tag }}
+          tags: cagriekin/repmgr:${{ steps.meta.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -5,6 +5,11 @@ if [ "$(id -u)" = "0" ]; then
     exec gosu postgres "$0" "$@"
 fi
 
+# pg_controldata / pg_ctl / repmgr's helpers live in the versioned bindir,
+# which is not on the default PATH; without this the local-timeline read below
+# silently fails and every standby restart does a full re-clone.
+export PATH=$PATH:/usr/lib/postgresql/18/bin
+
 ORDINAL=${HOSTNAME##*-}
 NODE_ID=$((ORDINAL + 1000))
 
@@ -50,7 +55,9 @@ echo "Generated repmgr.conf for ${NODE_TYPE} node"
 
 find_current_primary() {
     BASE_NAME="${HOSTNAME%-*}"
-    for i in $(seq 0 9); do
+    NODE_COUNT="${REPMGR_NODE_COUNT:-10}"
+    case "$NODE_COUNT" in ''|*[!0-9]*) NODE_COUNT=10 ;; esac
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
         [ "$i" = "$ORDINAL" ] && continue
         PARTNER="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
         if PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "${PARTNER}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1; then
