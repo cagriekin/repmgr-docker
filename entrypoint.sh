@@ -3,6 +3,17 @@ set -e
 
 SCRIPT_NAME=${1:-default}
 
+# Decimal value of an 8-hex-digit WAL-filename timeline. The first 8 chars of
+# pg_walfile_name(pg_current_wal_lsn()) are the timeline in HEX, so a SQL
+# `::int` cast is WRONG: it parses decimal, so '0000000A' (TL 10) errors and
+# '00000010' (TL 16) yields 10. Decode the hex here. Empty/non-hex -> empty
+# output (caller treats as unreadable). Kept in sync with the chart's
+# service-updater tl_to_int.
+tl_to_int() {
+    case "$1" in ''|*[!0-9A-Fa-f]*) return 0 ;; esac
+    echo $((16#$1))
+}
+
 # Scan sibling StatefulSet pods for an active primary and the newest timeline
 # seen. Sets REACHED_ANY/FOUND_PRIMARY/NEWEST_TLI/NEWEST_PEER. Timeline comes
 # from the WAL insert position (pg_walfile_name(pg_current_wal_lsn())), which
@@ -15,7 +26,7 @@ scan_peers() {
     local ordinal="${HOSTNAME##*-}" base="${HOSTNAME%-*}"
     local node_count="${REPMGR_NODE_COUNT:-10}"
     case "$node_count" in ''|*[!0-9]*) node_count=10 ;; esac
-    local i peer in_recovery remote_tli
+    local i peer in_recovery remote_hex remote_tli
     for i in $(seq 0 $((node_count - 1))); do
         [ "$i" = "$ordinal" ] && continue
         peer="${base}-${i}.${HEADLESS_SERVICE}"
@@ -24,13 +35,9 @@ scan_peers() {
         in_recovery=$(PGPASSWORD="$REPMGR_PASSWORD" psql -tAX -h "$peer" -p 5432 -U "$ru" -d "$rd" -c "SELECT pg_is_in_recovery();" 2>/dev/null) || in_recovery=""
         [ "$in_recovery" = "f" ] || continue
         FOUND_PRIMARY=1
-        # First 8 chars of the WAL filename are the timeline in HEX; decode with
-        # 16# in bash. A SQL `::int` cast is wrong (parses decimal: '0000000A'
-        # errors, '00000010' yields 10 not 16), which silently broke detection
-        # once a cluster passed timeline 10.
         remote_hex=$(PGPASSWORD="$REPMGR_PASSWORD" psql -tAX -h "$peer" -p 5432 -U "$ru" -d "$rd" -c "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8);" 2>/dev/null) || remote_hex=""
-        case "$remote_hex" in ''|*[!0-9A-Fa-f]*) continue ;; esac
-        remote_tli=$((16#$remote_hex))
+        remote_tli=$(tl_to_int "$remote_hex")
+        [ -n "$remote_tli" ] || continue
         if [ "$remote_tli" -gt "$NEWEST_TLI" ]; then NEWEST_TLI="$remote_tli"; NEWEST_PEER="$peer"; fi
     done
     return 0
