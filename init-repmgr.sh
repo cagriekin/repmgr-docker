@@ -71,6 +71,18 @@ find_current_primary() {
     return 1
 }
 
+# A primary-state data directory (data present, no standby.signal) must NOT be
+# re-cloned here. The old ordinal-based path would, on a full-cluster restart
+# after a failover, clone a real primary's data (pod-1, newer timeline) onto a
+# stale lower-timeline "primary" (pod-0 that came up first under OrderedReady)
+# and destroy every post-failover commit (#125). The entrypoint guard scans
+# peers and either resumes this node as primary or rewinds it FORWARD to a
+# newer-timeline peer -- never backward -- so defer the decision to it.
+if [ -s "${PGDATA}/PG_VERSION" ] && [ ! -f "${PGDATA}/standby.signal" ]; then
+    echo "Primary-state data directory present; deferring start/rewind decision to the entrypoint guard"
+    exit 0
+fi
+
 if [ "$NODE_TYPE" = "master" ]; then
     if [ ! -s "${PGDATA}/PG_VERSION" ]; then
         echo "First boot, postgres mode will initialize the database"
