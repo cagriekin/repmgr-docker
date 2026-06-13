@@ -24,8 +24,13 @@ scan_peers() {
         in_recovery=$(PGPASSWORD="$REPMGR_PASSWORD" psql -tAX -h "$peer" -p 5432 -U "$ru" -d "$rd" -c "SELECT pg_is_in_recovery();" 2>/dev/null) || in_recovery=""
         [ "$in_recovery" = "f" ] || continue
         FOUND_PRIMARY=1
-        remote_tli=$(PGPASSWORD="$REPMGR_PASSWORD" psql -tAX -h "$peer" -p 5432 -U "$ru" -d "$rd" -c "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8)::int;" 2>/dev/null) || remote_tli=""
-        case "$remote_tli" in ''|*[!0-9]*) continue ;; esac
+        # First 8 chars of the WAL filename are the timeline in HEX; decode with
+        # 16# in bash. A SQL `::int` cast is wrong (parses decimal: '0000000A'
+        # errors, '00000010' yields 10 not 16), which silently broke detection
+        # once a cluster passed timeline 10.
+        remote_hex=$(PGPASSWORD="$REPMGR_PASSWORD" psql -tAX -h "$peer" -p 5432 -U "$ru" -d "$rd" -c "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8);" 2>/dev/null) || remote_hex=""
+        case "$remote_hex" in ''|*[!0-9A-Fa-f]*) continue ;; esac
+        remote_tli=$((16#$remote_hex))
         if [ "$remote_tli" -gt "$NEWEST_TLI" ]; then NEWEST_TLI="$remote_tli"; NEWEST_PEER="$peer"; fi
     done
     return 0
