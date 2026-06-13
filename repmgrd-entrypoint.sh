@@ -25,12 +25,36 @@ for i in $(seq 1 120); do
     sleep 2
 done
 
-IN_RECOVERY=$(psql -h 127.0.0.1 -U postgres -d postgres -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs)
+# pg_isready (waited on above) only means postgres accepts connections, not
+# that the postgresql container's init SQL (CREATE EXTENSION repmgr, repmgr
+# user) has finished. Retry the role probe until it returns a definitive
+# answer so a transient empty result does not send a primary down the standby
+# branch.
+IN_RECOVERY=""
+for attempt in $(seq 1 30); do
+    IN_RECOVERY=$(psql -h 127.0.0.1 -U postgres -d postgres -tAc "SELECT pg_is_in_recovery();" 2>/dev/null)
+    case "$IN_RECOVERY" in t|f) break ;; esac
+    sleep 2
+done
 
 if [ "$IN_RECOVERY" = "f" ]; then
+    # Retry primary register (mirrors the standby path): under a slow start the
+    # repmgr extension/user may not exist the instant postgres accepts
+    # connections, and a single non-retried call under `set -e` would kill
+    # repmgrd into a CrashLoopBackOff that outlives the install's wait.
     echo "Registering primary node..."
-    repmgr -f /etc/repmgr/repmgr.conf primary register --force
-    echo "Primary registered"
+    for attempt in $(seq 1 30); do
+        if repmgr -f /etc/repmgr/repmgr.conf primary register --force 2>/dev/null; then
+            echo "Primary registered"
+            break
+        fi
+        if [ "$attempt" = "30" ]; then
+            echo "ERROR: Failed to register primary after 30 attempts"
+            exit 1
+        fi
+        echo "Primary register attempt ${attempt} failed (postgres/repmgr extension may not be ready); retrying in 5s..."
+        sleep 5
+    done
 else
     echo "Registering standby node..."
     for attempt in $(seq 1 30); do
