@@ -43,6 +43,20 @@ scan_peers() {
     return 0
 }
 
+# True when a primary was already recorded for this cluster, i.e. the durable
+# #125 primary-marker ConfigMap exists. Distinguishes a genuine first install
+# (no marker -> safe to initialize after one fast scan) from a PVC-loss recreate
+# of an empty pod while a cluster already exists (marker present -> settle before
+# concluding, so a briefly-unreachable primary is not missed and we don't initdb
+# a divergent cluster, #170). Needs kubectl + the marker name/namespace; if
+# either is absent (non-repmgr use, or kubectl/API unavailable) it returns
+# false, preserving the prior single-scan behavior so a first install never
+# pays the settle latency.
+cluster_was_established() {
+    [ -n "${PRIMARY_MARKER:-}" ] && [ -n "${NAMESPACE:-}" ] || return 1
+    kubectl get configmap "$PRIMARY_MARKER" -n "$NAMESPACE" >/dev/null 2>&1
+}
+
 # Re-clone PGDATA from $1 (primary host) WITHOUT destroying the current data
 # until the clone succeeds. rm -rf'ing PGDATA before the clone leaves an empty
 # data dir with no recoverable copy if every clone attempt fails (#175). Instead
@@ -83,11 +97,26 @@ primary_safety_guard() {
     local ru="${REPMGR_USER:-repmgr}" rd="${REPMGR_DB:-repmgr}"
 
     if [ ! -s "$PGDATA/PG_VERSION" ]; then
-        # Empty data dir. On a genuine first install no peer is primary yet, so
-        # a single fast scan keeps install latency low; if a primary already
-        # exists, initdb here would fork a divergent cluster. Auto-cloning an
-        # empty ordinal-0 is issue #125; here we refuse rather than diverge.
-        scan_peers
+        # Empty data dir. Initializing here while a peer is already primary forks
+        # a divergent cluster (#125), so refuse if any peer is primary. A genuine
+        # first install has no marker yet -> a single fast scan keeps install
+        # latency low (the common path is unchanged). Only when the durable
+        # primary marker shows a cluster was already established -- i.e. this
+        # empty pod is a PVC-loss recreate -- do we settle/retry the scan, so a
+        # briefly-unreachable primary is not missed in one scan window (#170).
+        # The settle therefore never delays a first install.
+        if cluster_was_established; then
+            local empty_attempts="${REPMGR_STALE_CHECK_ATTEMPTS:-5}" empty_attempt
+            case "$empty_attempts" in ''|*[!0-9]*) empty_attempts=5 ;; esac
+            for empty_attempt in $(seq 1 "$empty_attempts"); do
+                scan_peers
+                [ "$FOUND_PRIMARY" = "1" ] && break
+                [ "$REACHED_ANY" = "1" ] && break
+                [ "$empty_attempt" -lt "$empty_attempts" ] && { echo "stale-primary guard (empty data, primary marker present): no peer reachable yet (attempt ${empty_attempt}/${empty_attempts}); settling 3s" >&2; sleep 3; }
+            done
+        else
+            scan_peers
+        fi
         if [ "$FOUND_PRIMARY" = "1" ]; then
             echo "FATAL: data directory is empty but ${NEWEST_PEER:-a peer} is an active primary; refusing to initialize a divergent database. Recreate this pod with persistent storage, or clone it manually." >&2
             exit 1

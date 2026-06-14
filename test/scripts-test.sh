@@ -88,6 +88,41 @@ if [ ! -s /tmp/.rc_fn.sh ]; then bad "extract reclone_preserving_old from entryp
   rm -f /tmp/.rc_fn.sh
 fi
 
+# --- #170: empty-data settle is gated on the durable primary marker ---
+# A genuine first install (no marker) must take the fast single scan; only a
+# PVC-loss recreate (marker present) settles. This keeps the common path at the
+# proven low latency -- an unconditional settle (the reverted -12 attempt) added
+# ~30s to every fresh boot and destabilized slow-runner startup.
+sed -n '/^cluster_was_established() {/,/^}/p' "${ROOT}/entrypoint.sh" > /tmp/.cwe.sh
+if [ ! -s /tmp/.cwe.sh ]; then bad "extract cluster_was_established from entrypoint.sh"; else
+  ok "extract cluster_was_established from entrypoint.sh"
+  # marker present (kubectl get succeeds) -> established -> settle path
+  if ( source /tmp/.cwe.sh; kubectl() { return 0; }; PRIMARY_MARKER=m NAMESPACE=ns cluster_was_established ); then
+    ok "#170: marker present -> cluster established (settle)"
+  else
+    bad "#170: marker present should be established"
+  fi
+  # marker absent (kubectl NotFound -> non-zero) -> not established -> fast scan
+  if ( source /tmp/.cwe.sh; kubectl() { return 1; }; PRIMARY_MARKER=m NAMESPACE=ns cluster_was_established ); then
+    bad "#170: marker absent should NOT be established"
+  else
+    ok "#170: marker absent -> fast single scan"
+  fi
+  # unconfigured (no marker name / namespace) -> not established, never calls kubectl
+  if ( source /tmp/.cwe.sh; kubectl() { return 0; }; PRIMARY_MARKER="" NAMESPACE="" cluster_was_established ); then
+    bad "#170: unconfigured should NOT be established"
+  else
+    ok "#170: unconfigured -> fast single scan (no kubectl dependency)"
+  fi
+  rm -f /tmp/.cwe.sh
+fi
+# structural: the empty-data branch must gate the settle on cluster_was_established
+if grep -q 'if cluster_was_established; then' "${ROOT}/entrypoint.sh"; then
+  ok "#170: empty-data settle gated on cluster_was_established"
+else
+  bad "#170: empty-data settle not marker-gated"
+fi
+
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"
