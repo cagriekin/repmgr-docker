@@ -96,20 +96,29 @@ fi
 sed -n '/^cluster_was_established() {/,/^}/p' "${ROOT}/entrypoint.sh" > /tmp/.cwe.sh
 if [ ! -s /tmp/.cwe.sh ]; then bad "extract cluster_was_established from entrypoint.sh"; else
   ok "extract cluster_was_established from entrypoint.sh"
+  # timeout is stubbed to run its command (drop the duration) so the kubectl
+  # stub function is exercised rather than the real binary.
   # marker present (kubectl get succeeds) -> established -> settle path
-  if ( source /tmp/.cwe.sh; kubectl() { return 0; }; PRIMARY_MARKER=m NAMESPACE=ns cluster_was_established ); then
+  if ( source /tmp/.cwe.sh; timeout() { shift; "$@"; }; kubectl() { return 0; }; PRIMARY_MARKER=m NAMESPACE=ns cluster_was_established ); then
     ok "#170: marker present -> cluster established (settle)"
   else
     bad "#170: marker present should be established"
   fi
   # marker absent (kubectl NotFound -> non-zero) -> not established -> fast scan
-  if ( source /tmp/.cwe.sh; kubectl() { return 1; }; PRIMARY_MARKER=m NAMESPACE=ns cluster_was_established ); then
+  if ( source /tmp/.cwe.sh; timeout() { shift; "$@"; }; kubectl() { return 1; }; PRIMARY_MARKER=m NAMESPACE=ns cluster_was_established ); then
     bad "#170: marker absent should NOT be established"
   else
     ok "#170: marker absent -> fast single scan"
   fi
+  # bounded: if the kubectl call times out (throttled API), treat as not
+  # established (fast path) -- never a stall before initdb
+  if ( source /tmp/.cwe.sh; timeout() { return 124; }; kubectl() { return 0; }; PRIMARY_MARKER=m NAMESPACE=ns cluster_was_established ); then
+    bad "#170: kubectl timeout should NOT be treated as established"
+  else
+    ok "#170: kubectl timeout -> fast single scan (bounded, no stall)"
+  fi
   # unconfigured (no marker name / namespace) -> not established, never calls kubectl
-  if ( source /tmp/.cwe.sh; kubectl() { return 0; }; PRIMARY_MARKER="" NAMESPACE="" cluster_was_established ); then
+  if ( source /tmp/.cwe.sh; timeout() { shift; "$@"; }; kubectl() { return 0; }; PRIMARY_MARKER="" NAMESPACE="" cluster_was_established ); then
     bad "#170: unconfigured should NOT be established"
   else
     ok "#170: unconfigured -> fast single scan (no kubectl dependency)"
@@ -121,6 +130,35 @@ if grep -q 'if cluster_was_established; then' "${ROOT}/entrypoint.sh"; then
   ok "#170: empty-data settle gated on cluster_was_established"
 else
   bad "#170: empty-data settle not marker-gated"
+fi
+
+# behavioral: the empty-data settle must NOT break early on a merely-reachable
+# peer (a reachable standby is not proof the primary is gone), and must stop as
+# soon as an active primary is found. Drives settle_scan_for_primary with a
+# stubbed scan_peers.
+sed -n '/^settle_scan_for_primary() {/,/^}/p' "${ROOT}/entrypoint.sh" > /tmp/.ssp.sh
+if [ ! -s /tmp/.ssp.sh ]; then bad "extract settle_scan_for_primary from entrypoint.sh"; else
+  ok "extract settle_scan_for_primary from entrypoint.sh"
+  # peer reachable every scan but no primary -> must scan ALL attempts (the -14
+  # bug broke after attempt 1 on REACHED_ANY and would then have initdb'd)
+  noprimary_calls=$( ( source /tmp/.ssp.sh; sleep() { :; }
+    CALLS=0
+    scan_peers() { CALLS=$((CALLS+1)); REACHED_ANY=1; FOUND_PRIMARY=0; }
+    REPMGR_STALE_CHECK_ATTEMPTS=5 settle_scan_for_primary >/dev/null 2>&1
+    echo "$CALLS" ) )
+  [ "$noprimary_calls" = "5" ] \
+    && ok "#170: settle scans all attempts when no primary found (no early REACHED_ANY break)" \
+    || bad "#170: settle stopped early (CALLS=${noprimary_calls}, want 5)"
+  # primary appears on the 3rd scan -> stop exactly there
+  primary_calls=$( ( source /tmp/.ssp.sh; sleep() { :; }
+    CALLS=0
+    scan_peers() { CALLS=$((CALLS+1)); REACHED_ANY=1; [ "$CALLS" -ge 3 ] && FOUND_PRIMARY=1 || FOUND_PRIMARY=0; }
+    REPMGR_STALE_CHECK_ATTEMPTS=5 settle_scan_for_primary >/dev/null 2>&1
+    echo "$CALLS" ) )
+  [ "$primary_calls" = "3" ] \
+    && ok "#170: settle stops as soon as an active primary is found" \
+    || bad "#170: settle did not stop at primary (CALLS=${primary_calls}, want 3)"
+  rm -f /tmp/.ssp.sh
 fi
 
 echo "----"

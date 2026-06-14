@@ -54,7 +54,29 @@ scan_peers() {
 # pays the settle latency.
 cluster_was_established() {
     [ -n "${PRIMARY_MARKER:-}" ] && [ -n "${NAMESPACE:-}" ] || return 1
-    kubectl get configmap "$PRIMARY_MARKER" -n "$NAMESPACE" >/dev/null 2>&1
+    # Bounded: this runs before initdb on every fresh boot, so a throttled or
+    # unreachable API (the same client-go rate limiting that stalls installs on
+    # starved nodes) must not hang the guard. --request-timeout caps the API
+    # call; the outer `timeout` caps DNS/dial hangs. On any timeout/error we
+    # return non-zero -> fast single-scan path, never a stall before initdb.
+    timeout 5 kubectl get configmap "$PRIMARY_MARKER" -n "$NAMESPACE" --request-timeout=3s >/dev/null 2>&1
+}
+
+# Bounded settle for the empty-data path: re-scan peers until an active primary
+# is found (caller then refuses to initdb) or the attempts are exhausted. Unlike
+# the existing-data path it must NOT stop early just because some peer is
+# reachable -- on an EMPTY data dir a reachable standby is not proof the primary
+# is gone, and the primary may be transiently unreachable in any single scan
+# window; stopping there would initdb a divergent cluster (#170). Sets the same
+# FOUND_PRIMARY/NEWEST_PEER globals scan_peers does.
+settle_scan_for_primary() {
+    local attempts="${REPMGR_STALE_CHECK_ATTEMPTS:-5}" attempt
+    case "$attempts" in ''|*[!0-9]*) attempts=5 ;; esac
+    for attempt in $(seq 1 "$attempts"); do
+        scan_peers
+        [ "$FOUND_PRIMARY" = "1" ] && break
+        [ "$attempt" -lt "$attempts" ] && { echo "stale-primary guard (empty data, primary marker present): no active primary found yet (attempt ${attempt}/${attempts}); settling 3s" >&2; sleep 3; }
+    done
 }
 
 # Re-clone PGDATA from $1 (primary host) WITHOUT destroying the current data
@@ -104,16 +126,11 @@ primary_safety_guard() {
         # primary marker shows a cluster was already established -- i.e. this
         # empty pod is a PVC-loss recreate -- do we settle/retry the scan, so a
         # briefly-unreachable primary is not missed in one scan window (#170).
-        # The settle therefore never delays a first install.
+        # The settle therefore never delays a first install. (If an operator has
+        # deleted the marker to deliberately accept data loss, this falls to the
+        # fast path -- the documented escape hatch.)
         if cluster_was_established; then
-            local empty_attempts="${REPMGR_STALE_CHECK_ATTEMPTS:-5}" empty_attempt
-            case "$empty_attempts" in ''|*[!0-9]*) empty_attempts=5 ;; esac
-            for empty_attempt in $(seq 1 "$empty_attempts"); do
-                scan_peers
-                [ "$FOUND_PRIMARY" = "1" ] && break
-                [ "$REACHED_ANY" = "1" ] && break
-                [ "$empty_attempt" -lt "$empty_attempts" ] && { echo "stale-primary guard (empty data, primary marker present): no peer reachable yet (attempt ${empty_attempt}/${empty_attempts}); settling 3s" >&2; sleep 3; }
-            done
+            settle_scan_for_primary
         else
             scan_peers
         fi
