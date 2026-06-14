@@ -43,6 +43,32 @@ scan_peers() {
     return 0
 }
 
+# Re-clone PGDATA from $1 (primary host) WITHOUT destroying the current data
+# until the clone succeeds. rm -rf'ing PGDATA before the clone leaves an empty
+# data dir with no recoverable copy if every clone attempt fails (#175). Instead
+# move the contents to a sibling backup on the same volume (a fast rename),
+# clone into the emptied PGDATA, drop the backup only after a successful clone,
+# and keep it for manual recovery on failure. Returns 0 on success, 1 on
+# failure. Costs up to ~2x PGDATA disk during the re-clone.
+reclone_preserving_old() {
+    local primary="$1"
+    local ru="${REPMGR_USER:-repmgr}" rd="${REPMGR_DB:-repmgr}"
+    local backup="${PGDATA%/}.diverged.$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup"
+    ( shopt -s dotglob nullglob; mv "${PGDATA}"/* "$backup"/ 2>/dev/null ) || true
+    local a
+    for a in $(seq 1 5); do
+        if PGPASSWORD="$REPMGR_PASSWORD" repmgr -h "$primary" -U "$ru" -d "$rd" -f /etc/repmgr/repmgr.conf standby clone --force; then
+            rm -rf "$backup"
+            return 0
+        fi
+        echo "stale-primary guard: clone attempt ${a} from ${primary} failed; retrying in 5s" >&2
+        sleep 5
+    done
+    echo "stale-primary guard: re-clone from ${primary} failed; diverged data preserved at ${backup} for manual recovery" >&2
+    return 1
+}
+
 # Prevent a former primary from resuming read-write on a stale timeline after a
 # standby was promoted while this node's CONTAINER (not pod) was down -- the
 # init container, which holds the re-clone logic, does not re-run on a
@@ -57,11 +83,21 @@ primary_safety_guard() {
     local ru="${REPMGR_USER:-repmgr}" rd="${REPMGR_DB:-repmgr}"
 
     if [ ! -s "$PGDATA/PG_VERSION" ]; then
-        # Empty data dir. On a genuine first install no peer is primary yet, so
-        # a single fast scan keeps install latency low; if a primary already
-        # exists, initdb here would fork a divergent cluster. Auto-cloning an
-        # empty ordinal-0 is issue #125; here we refuse rather than diverge.
-        scan_peers
+        # Empty data dir. Initializing here while a peer is already primary forks
+        # a divergent cluster (the #125 data-loss outcome), so refuse if any peer
+        # is primary. A single scan can miss a primary that is briefly unreachable
+        # in its 3s window, so settle with the same bounded retry as the
+        # existing-data path below: keep scanning while NO peer answers, and stop
+        # as soon as a primary is found (-> refuse) or a peer answers with none
+        # primary (-> genuine fresh install, low latency to initialize). #170
+        local empty_attempts="${REPMGR_STALE_CHECK_ATTEMPTS:-5}" empty_attempt
+        case "$empty_attempts" in ''|*[!0-9]*) empty_attempts=5 ;; esac
+        for empty_attempt in $(seq 1 "$empty_attempts"); do
+            scan_peers
+            [ "$FOUND_PRIMARY" = "1" ] && break
+            [ "$REACHED_ANY" = "1" ] && break
+            [ "$empty_attempt" -lt "$empty_attempts" ] && { echo "stale-primary guard (empty data): no peer reachable yet (attempt ${empty_attempt}/${empty_attempts}); settling 3s before initializing" >&2; sleep 3; }
+        done
         if [ "$FOUND_PRIMARY" = "1" ]; then
             echo "FATAL: data directory is empty but ${NEWEST_PEER:-a peer} is an active primary; refusing to initialize a divergent database. Recreate this pod with persistent storage, or clone it manually." >&2
             exit 1
@@ -105,14 +141,7 @@ primary_safety_guard() {
         else
             echo "stale-primary guard: pg_rewind rejoin failed; falling back to full re-clone from ${NEWEST_PEER}" >&2
             pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true
-            rm -rf "${PGDATA:?}"/*
-            local cloned=0 a
-            for a in $(seq 1 5); do
-                if PGPASSWORD="$REPMGR_PASSWORD" repmgr -h "$NEWEST_PEER" -U "$ru" -d "$rd" -f /etc/repmgr/repmgr.conf standby clone --force; then cloned=1; break; fi
-                echo "stale-primary guard: clone attempt ${a} failed; retrying in 5s" >&2
-                sleep 5
-            done
-            [ "$cloned" = "1" ] || { echo "FATAL: re-clone failed after rejoin failure" >&2; exit 1; }
+            reclone_preserving_old "$NEWEST_PEER" || { echo "FATAL: re-clone failed after rejoin failure" >&2; exit 1; }
         fi
     fi
     return 0

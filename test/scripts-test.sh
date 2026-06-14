@@ -42,6 +42,68 @@ else
   ok "entrypoint.sh has no ::int-on-hex timeline cast"
 fi
 
+# --- #170: empty-data guard must settle/retry, not do a single unsettled scan ---
+# A primary that is briefly unreachable in the one 3s scan window would let an
+# empty pod-0 initdb a divergent cluster; the empty-data path must settle like
+# the existing-data path. Lock both settle loops in.
+if grep -q "settling 3s before initializing" "${ROOT}/entrypoint.sh"; then
+  ok "#170: empty-data path has a bounded settle loop"
+else
+  bad "#170: empty-data path missing settle loop"
+fi
+settle_loops=$(grep -c 'REPMGR_STALE_CHECK_ATTEMPTS:-5' "${ROOT}/entrypoint.sh" || true)
+if [ "${settle_loops}" -ge 2 ]; then
+  ok "#170: empty-data and existing-data paths both settle (${settle_loops} loops)"
+else
+  bad "#170: expected >=2 settle loops, found ${settle_loops}"
+fi
+
+# --- #175: reclone_preserving_old must not destroy data before a successful clone ---
+# rm -rf'ing PGDATA before the clone leaves an empty data dir if every clone
+# attempt fails. Extract the shipped function and drive it with a failing and a
+# succeeding clone stub, asserting the (diverged) data survives a failed clone.
+sed -n '/^reclone_preserving_old() {/,/^}/p' "${ROOT}/entrypoint.sh" > /tmp/.rc_fn.sh
+if [ ! -s /tmp/.rc_fn.sh ]; then bad "extract reclone_preserving_old from entrypoint.sh"; else
+  ok "extract reclone_preserving_old from entrypoint.sh"
+
+  # failure case: clone always fails -> returns 1 and the original data survives
+  fwork=$(mktemp -d); export PGDATA="${fwork}/pgdata"
+  mkdir -p "$PGDATA"; echo irreplaceable > "${PGDATA}/PG_VERSION"
+  frc=0
+  ( source /tmp/.rc_fn.sh
+    REPMGR_PASSWORD=x REPMGR_USER=r REPMGR_DB=d
+    repmgr() { return 1; }
+    sleep() { :; }
+    reclone_preserving_old testhost ) || frc=$?
+  [ "$frc" -eq 1 ] && ok "#175: reclone returns failure when every clone attempt fails" \
+                    || bad "#175: reclone rc=${frc} (want 1)"
+  if grep -rq irreplaceable "${fwork}"/pgdata.diverged.* 2>/dev/null; then
+    ok "#175: diverged data preserved on clone failure (no rm -rf before clone)"
+  else
+    bad "#175: diverged data lost on clone failure"
+  fi
+  rm -rf "$fwork"; unset PGDATA
+
+  # success case: clone succeeds -> returns 0 and the aside backup is removed
+  swork=$(mktemp -d); export PGDATA="${swork}/pgdata"
+  mkdir -p "$PGDATA"; echo old > "${PGDATA}/PG_VERSION"
+  src=0
+  ( source /tmp/.rc_fn.sh
+    REPMGR_PASSWORD=x REPMGR_USER=r REPMGR_DB=d
+    repmgr() { echo cloned > "${PGDATA}/PG_VERSION"; return 0; }
+    sleep() { :; }
+    reclone_preserving_old testhost ) || src=$?
+  [ "$src" -eq 0 ] && ok "#175: reclone returns success when clone succeeds" \
+                   || bad "#175: reclone rc=${src} (want 0)"
+  if ls -d "${swork}"/pgdata.diverged.* >/dev/null 2>&1; then
+    bad "#175: aside backup not cleaned up after successful clone"
+  else
+    ok "#175: aside backup cleaned up after successful clone"
+  fi
+  rm -rf "$swork"; unset PGDATA
+  rm -f /tmp/.rc_fn.sh
+fi
+
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"
