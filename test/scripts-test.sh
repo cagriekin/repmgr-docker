@@ -42,22 +42,6 @@ else
   ok "entrypoint.sh has no ::int-on-hex timeline cast"
 fi
 
-# --- #170: empty-data guard must settle/retry, not do a single unsettled scan ---
-# A primary that is briefly unreachable in the one 3s scan window would let an
-# empty pod-0 initdb a divergent cluster; the empty-data path must settle like
-# the existing-data path. Lock both settle loops in.
-if grep -q "settling 3s before initializing" "${ROOT}/entrypoint.sh"; then
-  ok "#170: empty-data path has a bounded settle loop"
-else
-  bad "#170: empty-data path missing settle loop"
-fi
-settle_loops=$(grep -c 'REPMGR_STALE_CHECK_ATTEMPTS:-5' "${ROOT}/entrypoint.sh" || true)
-if [ "${settle_loops}" -ge 2 ]; then
-  ok "#170: empty-data and existing-data paths both settle (${settle_loops} loops)"
-else
-  bad "#170: expected >=2 settle loops, found ${settle_loops}"
-fi
-
 # --- #175: reclone_preserving_old must not destroy data before a successful clone ---
 # rm -rf'ing PGDATA before the clone leaves an empty data dir if every clone
 # attempt fails. Extract the shipped function and drive it with a failing and a

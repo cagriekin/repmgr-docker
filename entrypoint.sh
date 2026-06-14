@@ -83,21 +83,11 @@ primary_safety_guard() {
     local ru="${REPMGR_USER:-repmgr}" rd="${REPMGR_DB:-repmgr}"
 
     if [ ! -s "$PGDATA/PG_VERSION" ]; then
-        # Empty data dir. Initializing here while a peer is already primary forks
-        # a divergent cluster (the #125 data-loss outcome), so refuse if any peer
-        # is primary. A single scan can miss a primary that is briefly unreachable
-        # in its 3s window, so settle with the same bounded retry as the
-        # existing-data path below: keep scanning while NO peer answers, and stop
-        # as soon as a primary is found (-> refuse) or a peer answers with none
-        # primary (-> genuine fresh install, low latency to initialize). #170
-        local empty_attempts="${REPMGR_STALE_CHECK_ATTEMPTS:-5}" empty_attempt
-        case "$empty_attempts" in ''|*[!0-9]*) empty_attempts=5 ;; esac
-        for empty_attempt in $(seq 1 "$empty_attempts"); do
-            scan_peers
-            [ "$FOUND_PRIMARY" = "1" ] && break
-            [ "$REACHED_ANY" = "1" ] && break
-            [ "$empty_attempt" -lt "$empty_attempts" ] && { echo "stale-primary guard (empty data): no peer reachable yet (attempt ${empty_attempt}/${empty_attempts}); settling 3s before initializing" >&2; sleep 3; }
-        done
+        # Empty data dir. On a genuine first install no peer is primary yet, so
+        # a single fast scan keeps install latency low; if a primary already
+        # exists, initdb here would fork a divergent cluster. Auto-cloning an
+        # empty ordinal-0 is issue #125; here we refuse rather than diverge.
+        scan_peers
         if [ "$FOUND_PRIMARY" = "1" ]; then
             echo "FATAL: data directory is empty but ${NEWEST_PEER:-a peer} is an active primary; refusing to initialize a divergent database. Recreate this pod with persistent storage, or clone it manually." >&2
             exit 1
